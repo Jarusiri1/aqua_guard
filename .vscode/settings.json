@@ -1,0 +1,7 @@
+{
+  "dart.flutterSdkPath": ".fvm/flutter_sdk",
+  "dart.sdkPath": ".fvm/flutter_sdk/bin/cache/dart-sdk",
+  "FSharp.suggestGitignore": false,
+  "cmake.ignoreCMakeListsMissing": true,
+  "java.configuration.updateBuildConfiguration": "interactive"
+}

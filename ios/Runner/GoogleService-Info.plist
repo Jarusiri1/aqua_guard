@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>API_KEY</key>
+	<string>AIzaSyDfFlIuPn4ndGxDkMmrcq6Nb3L6ztsIeYI</string>
+	<key>GCM_SENDER_ID</key>
+	<string>1084820543283</string>
+	<key>PLIST_VERSION</key>
+	<string>1</string>
+	<key>BUNDLE_ID</key>
+	<string>com.jarusirikobkaew.aquaguard</string>
+	<key>PROJECT_ID</key>
+	<string>aquaguard-a80cd</string>
+	<key>STORAGE_BUCKET</key>
+	<string>aquaguard-a80cd.firebasestorage.app</string>
+	<key>IS_ADS_ENABLED</key>
+	<false></false>
+	<key>IS_ANALYTICS_ENABLED</key>
+	<false></false>
+	<key>IS_APPINVITE_ENABLED</key>
+	<true></true>
+	<key>IS_GCM_ENABLED</key>
+	<true></true>
+	<key>IS_SIGNIN_ENABLED</key>
+	<true></true>
+	<key>GOOGLE_APP_ID</key>
+	<string>1:1084820543283:ios:dbf1263656afbe1c9d5046</string>
+</dict>
+</plist>
