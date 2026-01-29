@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
+//import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:video_player/video_player.dart';
 
 import '../models/tank.dart';
@@ -13,7 +13,7 @@ import 'water_change.dart'; // หน้าควบคุมเปลี่ย�
 const double kBtnHeight = 56.0;
 
 //ใส่ URL HLS จาก MediaMTX ของ Raspberry Pi
-const String kHlsUrl = 'http://172.20.10.3:8888/tank/index.m3u8';
+const String kHlsUrl = 'http://192.168.1.109:8888/tank/index.m3u8';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -32,6 +32,7 @@ class _HomePageState extends State<HomePage> {
   Timer? _timer;
 
   double? _ph, _tempC, _turbidity; // ค่าเซนเซอร์
+  bool? _phSensorActive; // สถานะว่า pH sensor อ่านค่าได้หรือไม่
   int? _moving, _noMoving;
 
   // >>> Water level flags
@@ -41,6 +42,10 @@ class _HomePageState extends State<HomePage> {
   VideoPlayerController? _video;
   Future<void>? _videoInit;
   bool _muted = true;
+
+  String? _phase; // เก็บค่า 'idle', 'draining', 'filling'
+  bool? _pumpDrainOn;
+  bool? _pumpFillOn;
 
   @override
   void initState() {
@@ -94,12 +99,11 @@ class _HomePageState extends State<HomePage> {
   }
 
   String _waterLevelText() {
-    if (_levelLow == true) return 'ต่ำ';
-    return 'ปกติ';
+    if (_levelLow == true) return 'ปกติ';
+    return 'ต่ำ';
   }
-
-  // ===== Metrics refresh (ไม่ realtime; กดปุ่มถึงจะสั่งวัด) =====
-  Future<void> _refreshAll() async {
+  
+Future<void> _refreshAll() async {
   final tank = _selectedTank;
   if (tank == null) return;
 
@@ -107,33 +111,66 @@ class _HomePageState extends State<HomePage> {
   try {
     final latest = await TankService.bumpAndFetchLatest(
       tank.id,
-      timeout: const Duration(seconds: 6),
-      minWait: const Duration(milliseconds: 300),
+      timeout: const Duration(seconds: 8),
+      minWait: const Duration(milliseconds: 1500),
     );
 
-    // pH อาจเป็นค่า status.ph (คาลิเบรตแล้ว) หรือโวลต์ดิบ status.pHvolt
-    final phMaybe = _toDoubleLoose(latest['ph']) ?? _toDoubleLoose(latest['pHvolt']);
+    // --- 1. pH Calculation (Verified: 2.374V -> pH 7.7) ---
+    final double? pHvoltRaw = _toDoubleLoose(latest['pHvolt']);
+    double? calculatedPh;
+    bool phActive = false;
 
-    setState(() {
-      _ph        = phMaybe;
-      _tempC     = _toDoubleLoose(latest['tempC']);
-      _turbidity = _toDoubleLoose(latest['turbidity']);
-      _levelLow  = _toBoolLoose(latest['levelLow']);
-      _moving    = latest['moving'] as int?;
-      _noMoving  = latest['noMoving'] as int?;
-    });
-  } catch (e, st) {
-    debugPrint('refresh error: $e\n$st');
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('ดึงข้อมูลไม่สำเร็จ: $e')),
-      );
+    if (pHvoltRaw != null && pHvoltRaw > 0.1) {
+      double neutralV = 2.5; 
+      double sensitivity = 0.18; 
+      // สูตร: 7 - (V_raw - V_neutral) / Sensitivity
+      double cal = 7.0 - (pHvoltRaw - neutralV) / sensitivity;
+      calculatedPh = cal.clamp(0.0, 14.0);
+      phActive = true;
     }
+
+    // --- 2. Turbidity Calculation (Verified: Water Clear -> 0.0 NTU) ---
+    final double? turbidityVolt = _toDoubleLoose(latest['turbidity']);
+    double? calculatedNtu;
+
+    if (turbidityVolt != null) {
+      double vClear = 1.15;  // จุดอ้างอิงน้ำใส
+      double vPepsi = 0.70;  // จุดอ้างอิงน้ำขุ่น
+      double ntuPepsi = 100.0; 
+
+      if (turbidityVolt >= vClear) {
+        calculatedNtu = 0.0;
+      } else {
+        double slope = (ntuPepsi - 0) / (vPepsi - vClear);
+        calculatedNtu = slope * (turbidityVolt - vClear);
+      }
+      
+      if (calculatedNtu! < 2.0) calculatedNtu = 0; // ตัด noise ต่ำๆ
+      if (calculatedNtu > 3000) calculatedNtu = 3000;
+    }
+
+    // --- 3. Sync Other Status ---
+    setState(() {
+      _ph = calculatedPh;
+      _phSensorActive = phActive;
+      _turbidity = calculatedNtu;
+      _tempC = _toDoubleLoose(latest['tempC']);
+      _levelLow = _toBoolLoose(latest['levelLow']);
+      _phase = latest['phase']?.toString() ?? 'idle';
+      _pumpDrainOn = _toBoolLoose(latest['pumpDrainOn']);
+      _pumpFillOn = _toBoolLoose(latest['pumpFillOn']);
+      _moving = latest['moving'] as int?;
+      _noMoving = latest['noMoving'] as int?;
+    });
+
+    debugPrint('Final UI Update -> pH: ${_ph?.toStringAsFixed(2)}, NTU: ${_turbidity?.toStringAsFixed(1)}');
+
+  } catch (e) {
+    debugPrint('Error in _refreshAll: $e');
   } finally {
     if (mounted) setState(() => _loading = false);
   }
 }
-
 
   void _startRealtime() {
     _timer?.cancel();
@@ -157,20 +194,52 @@ class _HomePageState extends State<HomePage> {
 
   // ===== Video handling =====
   void _initVideo() {
+    // 1. เคลียร์ตัวเก่าออกก่อนป้องกัน Memory Leak
     _video?.dispose();
+
+    // 2. สร้าง Controller ใหม่
     _video = VideoPlayerController.networkUrl(
       Uri.parse(kHlsUrl),
-      videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true),
+      videoPlayerOptions: VideoPlayerOptions(
+        mixWithOthers: true,
+        allowBackgroundPlayback: false,
+      ),
     );
 
+    // 3. เริ่มต้นการทำงาน (Initialize)
     _videoInit = _video!.initialize().then((_) async {
       await _video!.setLooping(true);
       await _video!.setVolume(_muted ? 0.0 : 1.0);
       await _video!.play();
+
+      // 4. [สำคัญ] เพิ่มระบบเช็คการ "ค้าง" ทุกๆ 2 วินาที
+      // ถ้าวิดีโอโหลดเสร็จแล้วแต่หยุดเล่นเอง (โดยที่ไม่ได้กด Pause) ให้สั่ง Play ใหม่ทันที
+      Timer.periodic(const Duration(seconds: 2), (timer) {
+        if (!mounted || _video == null) {
+          timer.cancel();
+          return;
+        }
+
+        final value = _video!.value;
+        // ถ้า initialized แล้ว, ไม่ได้เล่นอยู่, ไม่ได้บัฟเฟอร์ และไม่มี Error
+        if (value.isInitialized && 
+            !value.isPlaying && 
+            !value.isBuffering && 
+            !value.hasError) {
+          debugPrint("Video stalled, forcing play...");
+          _video!.play();
+        }
+      });
+
       if (mounted) setState(() {});
     }).catchError((e) {
       debugPrint('Video init error: $e');
+      // ถ้าโหลดไม่สำเร็จ ให้ลองโหลดใหม่หลังจาก 5 วินาที
+      Future.delayed(const Duration(seconds: 5), () {
+        if (mounted) _initVideo();
+      });
     });
+
     setState(() {});
   }
 
@@ -362,7 +431,11 @@ class _HomePageState extends State<HomePage> {
                 MetricPill(
                   color: cs.secondaryContainer.withOpacity(0.6),
                   label: 'PH',
-                  valueText: _loading ? '…' : (_ph?.toStringAsFixed(1) ?? '-'),
+                  valueText: _loading 
+                      ? '…' 
+                      : (_phSensorActive == false 
+                          ? 'none' 
+                          : (_ph?.toStringAsFixed(1) ?? 'none')),
                 ),
                 MetricPill(
                   color: cs.secondaryContainer.withOpacity(0.6),
@@ -376,7 +449,7 @@ class _HomePageState extends State<HomePage> {
                   label: 'Turbidity',
                   valueText: _loading
                       ? '…'
-                      : (_turbidity != null ? '${_turbidity!.toStringAsFixed(3)} V' : '-'),
+                      : (_turbidity != null ? '${_turbidity!.toStringAsFixed(3)} NTU' : '-'),
                 ),
                 MetricPill(
                   color: (_levelLow == true)
@@ -412,6 +485,21 @@ class _HomePageState extends State<HomePage> {
                 final cellWidth  = (constraints.maxWidth - crossAxisSpacing) / columns;
                 final cellHeight = cellWidth / childAspectRatio;
 
+                // --- Logic เปลี่ยนสีและข้อความตามสถานะปั๊ม ---
+                Color statusColor = cs.tertiaryContainer.withOpacity(0.6);
+                String statusLabel = 'เปลี่ยนน้ำ';
+                String statusValue = 'กดเพื่อทำงาน';
+
+                if (_phase == 'draining' || (_pumpDrainOn == true)) {
+                  statusColor = Colors.orange.withOpacity(0.8); // สีส้มตอนถ่ายน้ำ
+                  statusLabel = 'กำลังทำงาน';
+                  statusValue = 'ระบายน้ำออก...';
+                } else if (_phase == 'filling' || (_pumpFillOn == true)) {
+                  statusColor = Colors.blue.withOpacity(0.8);   // สีฟ้าตอนเติมน้ำ
+                  statusLabel = 'กำลังทำงาน';
+                  statusValue = 'เติมน้ำเข้า...';
+                }
+
                 return Center(
                   child: SizedBox(
                     width: cellWidth,
@@ -429,9 +517,9 @@ class _HomePageState extends State<HomePage> {
                               );
                             },
                       child: MetricPill(
-                        color: cs.tertiaryContainer.withOpacity(0.6),
-                        label: 'เปลี่ยนน้ำ',
-                        valueText: 'กดเพื่อทำงาน',
+                        color: statusColor,   // ใช้สีที่เปลี่ยนตามสถานะ
+                        label: statusLabel,   // ข้อความเปลี่ยนตามสถานะ
+                        valueText: statusValue, 
                       ),
                     ),
                   ),
@@ -441,6 +529,7 @@ class _HomePageState extends State<HomePage> {
 
             const SizedBox(height: 24),
 
+            // ปุ่ม Refresh
             SizedBox(
               width: double.infinity,
               child: FilledButton(
@@ -449,6 +538,8 @@ class _HomePageState extends State<HomePage> {
                 child: const Text('Refresh'),
               ),
             ),
+            
+            // Loading Bar
             if (_loading)
               const Padding(
                 padding: EdgeInsets.only(top: 12),

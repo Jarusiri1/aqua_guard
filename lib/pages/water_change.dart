@@ -16,11 +16,13 @@ class _WaterChangePageState extends State<WaterChangePage> {
   Map<String, dynamic> _status = const {};
   bool _sending = false;
 
+  // เพิ่มตัวแปรนี้: เอาไว้เก็บสถานะ "หลอก" เพื่อให้ UI เปลี่ยนทันที
+  String? _optimisticPhase; 
+  Timer? _optimisticResetTimer;
+
   @override
   void initState() {
     super.initState();
-
-    // สร้าง devices/{id} และ ctrl/waterChange อัตโนมัติถ้ายังไม่มี
     TankService.ensureDeviceInitialized(widget.tank.id).catchError((e) {
       debugPrint('seed error: $e');
     });
@@ -28,6 +30,16 @@ class _WaterChangePageState extends State<WaterChangePage> {
     _sub = TankService.streamWaterStatus(widget.tank.id).listen(
       (data) {
         if (!mounted) return;
+        
+        // ถ้าสถานะจริงจาก Pi ส่งมาตรงกับที่เรา "หลอก" ไว้แล้ว
+        // ให้ยกเลิกการหลอก แล้วใช้ค่าจริงแทน (UI จะได้ไม่กระพริบ)
+        if (_optimisticPhase != null) {
+           final realPhase = data['phase'];
+           if (realPhase == _optimisticPhase) {
+             _optimisticPhase = null; // สถานะตรงกันแล้ว เลิกหลอก
+           }
+        }
+        
         setState(() => _status = data);
       },
       onError: (e) => debugPrint('water stream error: $e'),
@@ -37,6 +49,7 @@ class _WaterChangePageState extends State<WaterChangePage> {
   @override
   void dispose() {
     _sub?.cancel();
+    _optimisticResetTimer?.cancel();
     super.dispose();
   }
 
@@ -48,7 +61,7 @@ class _WaterChangePageState extends State<WaterChangePage> {
         context: context,
         builder: (_) => AlertDialog(
           title: const Text('ยืนยันการสั่งงาน'),
-          content: Text('สั่ง “$cmd” ไปยัง ${widget.tank.name}?'),
+          content: Text('ต้องการสั่ง “$cmd” ใช่หรือไม่?'),
           actions: [
             TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('ยกเลิก')),
             FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('ยืนยัน')),
@@ -58,20 +71,39 @@ class _WaterChangePageState extends State<WaterChangePage> {
       if (ok != true) return;
     }
 
-    setState(() => _sending = true);
+    // 1. ตั้งค่า Optimistic Phase (เปลี่ยนสีปุ่มทันที ไม่ต้องรอเน็ต)
+    setState(() {
+      _sending = true;
+      if (cmd == 'drain') {
+        _optimisticPhase = 'draining';
+      } else if (cmd == 'fill') _optimisticPhase = 'filling';
+      else if (cmd == 'stop') _optimisticPhase = 'idle';
+    });
+
+    // กันเหนียว: ถ้าผ่านไป 5 วิ แล้ว Pi ยังไม่ตอบสนอง ให้เลิกหลอก (กัน UI ค้าง)
+    _optimisticResetTimer?.cancel();
+    _optimisticResetTimer = Timer(const Duration(seconds: 5), () {
+      if (mounted) setState(() => _optimisticPhase = null);
+    });
+
     try {
       await TankService
           .sendWaterCommand(widget.tank.id, cmd)
           .timeout(const Duration(seconds: 8));
+      
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('ส่งคำสั่ง $cmd แล้ว')));
+      
     } on TimeoutException {
       if (!mounted) return;
+      // ถ้าส่งไม่ผ่าน ให้ยกเลิกสถานะหลอก
+      setState(() => _optimisticPhase = null);
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('ช้าเกินไป: โปรดตรวจอินเทอร์เน็ตหรือสิทธิ์ Firestore')),
+        const SnackBar(content: Text('ช้าเกินไป: โปรดตรวจอินเทอร์เน็ต')),
       );
     } catch (e) {
       if (!mounted) return;
+      setState(() => _optimisticPhase = null);
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('ส่งคำสั่งล้มเหลว: $e')));
     } finally {
       if (mounted) setState(() => _sending = false);
@@ -80,33 +112,23 @@ class _WaterChangePageState extends State<WaterChangePage> {
 
   String _phaseText(dynamic phase) {
     switch ('$phase') {
-      case 'draining':
-        return 'กำลังระบายน้ำออก';
-      case 'filling':
-        return 'กำลังเติมน้ำเข้า';
-      case 'done':
-        return 'เสร็จสิ้น';
-      case 'error':
-        return 'ผิดพลาด';
+      case 'draining': return 'กำลังระบายน้ำออก';
+      case 'filling':  return 'กำลังเติมน้ำเข้า';
+      case 'done':     return 'เสร็จสิ้น';
+      case 'error':    return 'ผิดพลาด';
       case 'idle':
-      default:
-        return 'พร้อมทำงาน (Idle)';
+      default:         return 'พร้อมทำงาน (Idle)';
     }
   }
 
   Color _phaseColor(ColorScheme cs, dynamic phase) {
     switch ('$phase') {
-      case 'draining':
-        return Colors.orange;
-      case 'filling':
-        return Colors.blue;
-      case 'done':
-        return Colors.green;
-      case 'error':
-        return cs.error;
+      case 'draining': return Colors.orange;
+      case 'filling':  return Colors.blue;
+      case 'done':     return Colors.green;
+      case 'error':    return cs.error;
       case 'idle':
-      default:
-        return cs.secondary;
+      default:         return cs.secondary;
     }
   }
 
@@ -114,14 +136,25 @@ class _WaterChangePageState extends State<WaterChangePage> {
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
 
-    final phase = _status['phase'] ?? 'idle';
-    final pumpDrainOn = _status['pumpDrainOn'] == true;
-    final pumpFillOn = _status['pumpFillOn'] == true;
-    final levelLow = _status['levelLow'] == true;
-    final levelHigh = _status['levelHigh'] == true;
+    // --- LOGIC การแสดงผลแบบ Instant ---
+    // ใช้ค่าจาก _optimisticPhase (ถ้ามี) มาแสดงก่อน ถ้าไม่มีค่อยใช้ค่าจริงจาก _status
+    final realPhase = _status['phase'] ?? 'idle';
+    final displayPhase = _optimisticPhase ?? realPhase;
+
+    // สถานะปุ่ม: ให้ดูว่า Optimistic สั่งอะไรไว้ หรือ ค่าจริงเป็นยังไง
+    final bool isDrainActive = displayPhase == 'draining' || _status['pumpDrainOn'] == true;
+    final bool isFillActive = displayPhase == 'filling' || _status['pumpFillOn'] == true;
+
     final turbidity = _status['turbidity'] as num?;
     final updatedAt = _status['updatedAt'] as DateTime?;
-    final isFresh = updatedAt != null && DateTime.now().difference(updatedAt).inSeconds <= 10;
+    final isFresh = updatedAt != null && DateTime.now().difference(updatedAt).inSeconds <= 15;
+
+    // Logic Sensor (คงเดิมจากรอบที่แล้ว)
+    final bool rawLow = _status['levelHigh'] == true;    
+    final bool rawNormal = _status['levelLow'] == true;  
+    final bool showNormal = rawNormal;
+    final bool showLow = rawLow && !rawNormal; // ไฟ Low ดับเมื่อถึง Normal
+    final bool isLowWarning = !rawLow;
 
     return Scaffold(
       appBar: AppBar(
@@ -132,30 +165,27 @@ class _WaterChangePageState extends State<WaterChangePage> {
           ListView(
             padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
             children: [
-              // หัวข้อ + สถานะ + เวลาล่าสุด
+              // Header ใช้ displayPhase (ค่าที่ตอบสนองทันที)
               Row(
                 children: [
-                  Icon(Icons.water_drop, color: _phaseColor(cs, phase)),
+                  Icon(Icons.water_drop, color: _phaseColor(cs, displayPhase)),
                   const SizedBox(width: 8),
                   Text(
-                    'การเปลี่ยนน้ำ',
-                    style: Theme.of(context)
-                        .textTheme
-                        .titleLarge!
-                        .copyWith(fontWeight: FontWeight.w800),
+                    'สถานะการทำงาน',
+                    style: Theme.of(context).textTheme.titleLarge!.copyWith(fontWeight: FontWeight.w800),
                   ),
                   const Spacer(),
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                     decoration: BoxDecoration(
-                      color: _phaseColor(cs, phase).withOpacity(0.12),
+                      color: _phaseColor(cs, displayPhase).withOpacity(0.12),
                       borderRadius: BorderRadius.circular(999),
-                      border: Border.all(color: _phaseColor(cs, phase).withOpacity(0.4)),
+                      border: Border.all(color: _phaseColor(cs, displayPhase).withOpacity(0.4)),
                     ),
                     child: Text(
-                      _phaseText(phase),
+                      _phaseText(displayPhase),
                       style: TextStyle(
-                        color: _phaseColor(cs, phase),
+                        color: _phaseColor(cs, displayPhase),
                         fontWeight: FontWeight.w700,
                       ),
                     ),
@@ -164,7 +194,6 @@ class _WaterChangePageState extends State<WaterChangePage> {
               ),
               const SizedBox(height: 8),
 
-              // แสดงความสด + เวลาอัปเดตล่าสุด
               Row(
                 children: [
                   Icon(Icons.circle, size: 10, color: isFresh ? Colors.green : cs.error),
@@ -182,135 +211,102 @@ class _WaterChangePageState extends State<WaterChangePage> {
               ),
               const SizedBox(height: 16),
 
-              // ชิปสถานะ
+              // Chips ใช้ isDrainActive / isFillActive (ตอบสนองทันที)
               Wrap(
                 spacing: 8,
                 runSpacing: 8,
                 children: [
-                  _chip(cs, 'Pump Drain', pumpDrainOn, Icons.arrow_downward),
-                  _chip(cs, 'Pump Fill', pumpFillOn, Icons.arrow_upward),
+                  _chip(cs, 'Pump Drain', isDrainActive, Icons.arrow_downward, activeColor: Colors.orange),
+                  _chip(cs, 'Pump Fill', isFillActive, Icons.arrow_upward, activeColor: Colors.blue),
                   Chip(
                     avatar: const Icon(Icons.opacity, size: 18),
-                    label: Text(
-                      'Turbidity: ${turbidity == null ? '-' : turbidity.toStringAsFixed(3)}',
-                    ),
+                    label: Text('Turbidity: ${turbidity?.toStringAsFixed(3) ?? '-'}'),
                   ),
                 ],
               ),
               const SizedBox(height: 8),
 
-              // Float switch
               Wrap(
                 spacing: 16,
                 runSpacing: 8,
                 children: [
-                  _level(cs, 'ระดับต่ำ (LOW)', levelLow),
-                  _level(cs, 'ระดับสูง (HIGH)', levelHigh),
+                  _level(cs, 'ระดับต่ำ (LOW)', showLow, isWarning: isLowWarning),
+                  _level(cs, 'ระดับปกติ (NORMAL)', showNormal),
                 ],
               ),
-              const SizedBox(height: 18),
+              const SizedBox(height: 24),
+
+              const Divider(),
+              const SizedBox(height: 10),
+              
+              Text('ควบคุม (Manual Mode)', 
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: cs.primary)),
+              const SizedBox(height: 16),
 
               // ปุ่มควบคุม
               Row(
                 children: [
-                  Expanded(
-                    child: FilledButton.icon(
-                      onPressed: _sending ? null : () => _send('start', confirm: true),
-                      icon: const Icon(Icons.play_circle),
-                      label: const Text('Start (Auto)'),
-                      style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(48)),
-                    ),
-                  ),
-                  const SizedBox(width: 10),
+                  // ปุ่ม Drain
                   Expanded(
                     child: OutlinedButton.icon(
-                      onPressed: _sending ? null : () => _send('drain'),
+                      // ป้องกันการกดซ้อน: ถ้ากำลังส่ง หรือ Fill ทำงานอยู่ ห้ามกด
+                      onPressed: (_sending || isFillActive) ? null : () => _send('drain'),
                       icon: const Icon(Icons.arrow_downward),
-                      label: const Text('Drain'),
-                      style: OutlinedButton.styleFrom(minimumSize: const Size.fromHeight(48)),
+                      label: Text(isDrainActive ? 'กำลังระบาย...' : 'Drain (ระบายออก)'),
+                      style: OutlinedButton.styleFrom(
+                        minimumSize: const Size.fromHeight(56),
+                        // ใช้ isDrainActive เพื่อเปลี่ยนสีทันที
+                        backgroundColor: isDrainActive ? Colors.orange.withOpacity(0.15) : null,
+                        side: isDrainActive ? const BorderSide(color: Colors.orange, width: 2) : null,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  // ปุ่ม Fill
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: (_sending || isDrainActive) ? null : () => _send('fill'),
+                      icon: const Icon(Icons.arrow_upward),
+                      label: Text(isFillActive ? 'กำลังเติม...' : 'Fill (เติมเข้า)'),
+                      style: OutlinedButton.styleFrom(
+                        minimumSize: const Size.fromHeight(56),
+                        // ใช้ isFillActive เพื่อเปลี่ยนสีทันที
+                        backgroundColor: isFillActive ? Colors.blue.withOpacity(0.15) : null,
+                        side: isFillActive ? const BorderSide(color: Colors.blue, width: 2) : null,
+                      ),
                     ),
                   ),
                 ],
               ),
-              const SizedBox(height: 10),
-              Row(
-                children: [
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      onPressed: _sending ? null : () => _send('fill'),
-                      icon: const Icon(Icons.arrow_upward),
-                      label: const Text('Fill'),
-                      style: OutlinedButton.styleFrom(minimumSize: const Size.fromHeight(48)),
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: FilledButton.tonalIcon(
-                      onPressed: _sending ? null : () => _send('stop', confirm: true),
-                      icon: const Icon(Icons.stop_circle),
-                      label: const Text('Stop'),
-                      style: FilledButton.styleFrom(
-                        minimumSize: const Size.fromHeight(48)),
-                    ),
-                  ),
-                ],
+              const SizedBox(height: 16),
+              
+              // ปุ่ม STOP
+              FilledButton.icon(
+                onPressed: _sending ? null : () => _send('stop', confirm: false),
+                icon: const Icon(Icons.stop_circle_outlined, size: 28),
+                label: const Text('STOP (หยุดทุกอย่าง)', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                style: FilledButton.styleFrom(
+                  minimumSize: const Size.fromHeight(64),
+                  backgroundColor: cs.error,
+                  foregroundColor: cs.onError,
+                ),
               ),
 
-              // คำเตือนถ้าข้อมูลไม่สด
               if (!isFresh)
                 Padding(
-                  padding: const EdgeInsets.only(top: 16),
-                  child: Container(
-                    decoration: BoxDecoration(
-                      color: cs.errorContainer.withOpacity(0.6),
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                    child: Row(
-                      children: [
-                        Icon(Icons.warning_amber_rounded, color: cs.onErrorContainer),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: Text(
-                            'ข้อมูลไม่อัปเดต (อาจหลุดจาก Pi/เน็ต) ตรวจสคริปต์บน Raspberry Pi',
-                            style: TextStyle(
-                              color: cs.onErrorContainer,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
+                  padding: const EdgeInsets.only(top: 24),
+                  child: Center(
+                     child: Text('ข้อมูลไม่อัปเดต (ตรวจสอบ Pi)', style: TextStyle(color: cs.error))
                   ),
                 ),
             ],
           ),
-
-          // Overlay โหลดขณะส่งคำสั่ง
+          
           if (_sending)
             Positioned.fill(
               child: Container(
-                color: Colors.black.withOpacity(0.08),
-                child: const Center(
-                  child: Card(
-                    elevation: 6,
-                    child: Padding(
-                      padding: EdgeInsets.symmetric(horizontal: 18, vertical: 14),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          SizedBox(
-                              width: 22,
-                              height: 22,
-                              child: CircularProgressIndicator(strokeWidth: 3)),
-                          SizedBox(width: 12),
-                          Text('กำลังส่งคำสั่ง...',
-                              style: TextStyle(fontWeight: FontWeight.w700)),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
+                color: Colors.black12,
+                child: const Center(child: CircularProgressIndicator()),
               ),
             ),
         ],
@@ -318,29 +314,48 @@ class _WaterChangePageState extends State<WaterChangePage> {
     );
   }
 
-  Chip _chip(ColorScheme cs, String label, bool on, IconData icon) {
+  Chip _chip(ColorScheme cs, String label, bool on, IconData icon, {Color? activeColor}) {
+    final color = activeColor ?? Colors.green;
     return Chip(
       avatar: Icon(icon, size: 18, color: on ? Colors.white : cs.onSurfaceVariant),
       label: Text(label),
-      backgroundColor: on ? Colors.green : cs.surfaceVariant,
+      backgroundColor: on ? color : cs.surfaceContainerHighest,
       labelStyle: TextStyle(color: on ? Colors.white : cs.onSurfaceVariant),
+      side: BorderSide.none,
     );
   }
 
-  Widget _level(ColorScheme cs, String label, bool on) {
+  Widget _level(ColorScheme cs, String label, bool on, {bool isWarning = false}) {
+    Color iconColor;
+    if (isWarning) {
+      iconColor = cs.error;
+    } else if (on) {
+      iconColor = Colors.green;
+    } else {
+      iconColor = cs.onSurfaceVariant.withOpacity(0.5);
+    }
+
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Icon(on ? Icons.sensors : Icons.sensors_off,
-            size: 18, color: on ? Colors.green : cs.onSurfaceVariant),
+        Icon(
+          isWarning ? Icons.warning_amber_rounded : (on ? Icons.radio_button_checked : Icons.radio_button_unchecked),
+          size: 20,
+          color: iconColor,
+        ),
         const SizedBox(width: 6),
-        Text(label, style: TextStyle(color: cs.onSurfaceVariant)),
+        Text(
+          label,
+          style: TextStyle(
+            color: isWarning ? cs.error : cs.onSurfaceVariant,
+            fontWeight: (on || isWarning) ? FontWeight.bold : FontWeight.normal,
+          ),
+        ),
       ],
     );
   }
 
   String _fmtTime(DateTime dt) {
-    // HH:mm:ss (local)
     final h = dt.hour.toString().padLeft(2, '0');
     final m = dt.minute.toString().padLeft(2, '0');
     final s = dt.second.toString().padLeft(2, '0');

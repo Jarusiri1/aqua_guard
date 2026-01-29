@@ -20,6 +20,28 @@ class TankService {
     return int.tryParse(x.toString());
   }
 
+  /// แปลงค่าโวลต์จาก pH sensor เป็นค่า pH
+  /// สูตร: pH = 7 - (voltage - 2.5) / 0.18
+  /// ที่ pH 7 (น้ำปกติ) จะได้ voltage = 2.5V
+  /// ถ้า voltage เพิ่มขึ้น pH จะลดลง (เป็นกรด)
+  /// ถ้า voltage ลดลง pH จะเพิ่มขึ้น (เป็นด่าง)
+  /// 
+  /// ตัวอย่าง:
+  /// - voltage = 2.5V → pH = 7.0 (น้ำปกติ)
+  /// - voltage = 3.5V → pH = 1.4 (กรดแรง)
+  /// - voltage = 1.5V → pH = 12.6 (ด่างแรง)
+  static double? _convertPhVoltToPh(double? voltage) {
+    if (voltage == null) return null;
+    // สูตรแปลงโวลต์เป็น pH: pH = 7 - (voltage - 2.5) / 0.18
+    // สำหรับ pH sensor ที่มี offset 2.5V ที่ pH 7
+    // สูตรนี้ใช้สำหรับ sensor ที่มี slope -0.18 V/pH unit
+    final ph = 7.0 - (voltage - 2.5) / 0.18;
+    // จำกัดค่า pH ระหว่าง 0-14
+    if (ph < 0) return 0.0;
+    if (ph > 14) return 14.0;
+    return ph;
+  }
+
   // ========= Bootstrapping =========
   /// เรียกครั้งเดียว (หรือทุกครั้งที่เปิดหน้า) เพื่อให้มั่นใจว่ามี doc/โครงสร้างพื้นฐาน
   static Future<void> ensureDeviceInitialized(String tankId) async {
@@ -95,7 +117,7 @@ devRef.collection('ctrl').doc('levels').set({
     final snap = await ref.get();
     if (!snap.exists) throw Exception('device-not-found: $tankId');
 
-    T? _get<T>(String path) {
+    T? get<T>(String path) {
       try {
         final v = snap.get(path);
         return v is T ? v : null;
@@ -107,22 +129,33 @@ devRef.collection('ctrl').doc('levels').set({
     final d = snap.data() ?? <String, dynamic>{};
     final s = (d['status'] ?? const {}) as Map<String, dynamic>;
 
-    final num? phFromStatus = _get<num>('status.ph');
-    final num? pHvolt       = _get<num>('status.pHvolt');
+    final num? phFromStatus = get<num>('status.ph');
+    final num? pHvolt       = get<num>('status.pHvolt');
+
+    // ใช้ pHvolt เป็นหลัก (ค่าใหม่) แปลงเป็น pH ถ้ามี
+    // ถ้าไม่มี pHvolt ค่อยใช้ phFromStatus หรือค่า default
+    final double? phConverted = pHvolt != null 
+        ? _convertPhVoltToPh(_asDouble(pHvolt))
+        : (phFromStatus != null ? _asDouble(phFromStatus) : null);
+
+    // Debug: แสดงค่า pHvolt และ pH ที่แปลงได้
+    debugPrint('pH sensor [fetchLatest]: pHvolt=$pHvolt, phFromStatus=$phFromStatus, converted pH=$phConverted, d[ph]=${d['ph']}');
 
     return {
-      // ใช้ค่าใต้ status ก่อน ถ้าไม่มีค่อย fallback ไป top-level
-      'ph'       : _asDouble(phFromStatus ?? pHvolt ?? d['ph']),
+      // ใช้ค่า pHvolt ที่แปลงแล้วเป็นหลัก (ค่าใหม่) 
+      // ถ้าไม่มี pHvolt และไม่มี phFromStatus ค่อย fallback ไป d['ph']
+      // แต่ถ้ามี pHvolt ต้องแปลงเสมอ (ไม่ใช้ค่าเก่า)
+      'ph'       : phConverted ?? (pHvolt == null ? _asDouble(d['ph']) : null),
       'pHvolt'   : _asDouble(pHvolt),
-      'tempC'    : _asDouble(_get<num>('status.tempC') ?? d['tempC']),
+      'tempC'    : _asDouble(get<num>('status.tempC') ?? d['tempC']),
       'moving'   : _asInt(d['moving']) ?? 0,
       'noMoving' : _asInt(d['noMoving']) ?? 0,
-      'turbidity': _asDouble(_get<num>('status.turbidity') ?? s['turbidity']),
+      'turbidity': _asDouble(get<num>('status.turbidity') ?? s['turbidity']),
 
-      'levelLow' : _get<bool>('status.levelLow')  ?? (s['levelLow']  == true),
-      'levelHigh': _get<bool>('status.levelHigh') ?? (s['levelHigh'] == true),
+      'levelLow' : get<bool>('status.levelLow')  ?? (s['levelLow']  == true),
+      'levelHigh': get<bool>('status.levelHigh') ?? (s['levelHigh'] == true),
 
-      'updatedAt': (_get<Timestamp>('status.updatedAt') ?? s['updatedAt'] as Timestamp?)?.toDate(),
+      'updatedAt': (get<Timestamp>('status.updatedAt') ?? s['updatedAt'] as Timestamp?)?.toDate(),
     };
   } on FirebaseException {
     rethrow;
@@ -187,7 +220,7 @@ static Future<void> requestLevelsOnce(String tankId) async {
     requestLevelsOnce(tankId),
   ]);
 
-  // เว้นระยะสั้น ๆ ให้ daemon ทำงาน
+  // เว้นระยะสั้น ๆ ให้ daemon ทำงาน (pH sensor อาจต้องใช้เวลาเสถียร)
   await Future.delayed(minWait);
 
   try {
@@ -203,7 +236,7 @@ static Future<void> requestLevelsOnce(String tankId) async {
           }
         });
 
-    T? _get<T>(String path) {
+    T? get<T>(String path) {
       try {
         final v = snap.get(path);
         return v is T ? v : null;
@@ -212,24 +245,44 @@ static Future<void> requestLevelsOnce(String tankId) async {
       }
     }
 
-    final d = snap.data() as Map<String, dynamic>? ?? {};
+    final d = snap.data() ?? {};
     final s = (d['status'] ?? const {}) as Map<String, dynamic>;
 
-    final num? phFromStatus = _get<num>('status.ph');
-    final num? pHvolt       = _get<num>('status.pHvolt');
+    final num? phFromStatus = get<num>('status.ph');
+    final num? pHvolt       = get<num>('status.pHvolt');
+
+    // ใช้ pHvolt เป็นหลัก (ค่าใหม่) แปลงเป็น pH ถ้ามี
+    // ถ้าไม่มี pHvolt ค่อยใช้ phFromStatus หรือค่า default
+    final double? phConverted = pHvolt != null 
+        ? _convertPhVoltToPh(_asDouble(pHvolt))
+        : (phFromStatus != null ? _asDouble(phFromStatus) : null);
+
+    // Debug: แสดงค่า pHvolt และ pH ที่แปลงได้
+    debugPrint('pH sensor [bumpAndFetchLatest]: pHvolt=$pHvolt, phFromStatus=$phFromStatus, converted pH=$phConverted');
+    if (pHvolt != null) {
+      final calculated = 7.0 - (pHvolt.toDouble() - 2.5) / 0.18;
+      debugPrint('  -> pH calculation: 7 - ($pHvolt - 2.5) / 0.18 = ${calculated.toStringAsFixed(2)}');
+      debugPrint('  -> pH range check: voltage ${pHvolt}V → pH ${calculated.toStringAsFixed(1)}');
+      debugPrint('  -> Expected: pH 7 (water) = 2.5V, pH 2 (lemon) = ~3.4V, pH 10 (alkaline) = ~1.3V');
+    } else {
+      debugPrint('  -> WARNING: pHvolt is NULL! Sensor may not be reading new values.');
+      debugPrint('  -> This means the sensor is not updating. Check sensor connection.');
+    }
 
     return {
-      'ph'       : _asDouble(phFromStatus ?? pHvolt ?? d['ph']),
+      // ใช้ค่า pHvolt ที่แปลงแล้วเป็นหลัก (ค่าใหม่)
+      // ถ้าไม่มี pHvolt และไม่มี phFromStatus ค่อย fallback ไป d['ph']
+      'ph'       : phConverted ?? (pHvolt == null ? _asDouble(d['ph']) : null),
       'pHvolt'   : _asDouble(pHvolt),
-      'tempC'    : _asDouble(_get<num>('status.tempC') ?? d['tempC']),
+      'tempC'    : _asDouble(get<num>('status.tempC') ?? d['tempC']),
       'moving'   : _asInt(d['moving']) ?? 0,
       'noMoving' : _asInt(d['noMoving']) ?? 0,
-      'turbidity': _asDouble(_get<num>('status.turbidity') ?? s['turbidity']),
+      'turbidity': _asDouble(get<num>('status.turbidity') ?? s['turbidity']),
 
-      'levelLow' : _get<bool>('status.levelLow')  ?? (s['levelLow']  == true),
-      'levelHigh': _get<bool>('status.levelHigh') ?? (s['levelHigh'] == true),
+      'levelLow' : get<bool>('status.levelLow')  ?? (s['levelLow']  == true),
+      'levelHigh': get<bool>('status.levelHigh') ?? (s['levelHigh'] == true),
 
-      'updatedAt': (_get<Timestamp>('status.updatedAt') ?? s['updatedAt'] as Timestamp?)?.toDate(),
+      'updatedAt': (get<Timestamp>('status.updatedAt') ?? s['updatedAt'] as Timestamp?)?.toDate(),
     };
   } catch (e) {
     debugPrint('bumpAndFetchLatest timeout/fail -> $e (fallback fetchLatest)');
@@ -248,10 +301,13 @@ static Future<void> requestLevelsOnce(String tankId) async {
       final ts = s['updatedAt'];
       if (ts is Timestamp) updatedAt = ts.toDate();
 
-      // อ่าน pH จริงถ้ามี, ถ้าไม่มีให้ fallback เป็นโวลต์ดิบ (pHvolt)
+      // ใช้ pHvolt เป็นหลัก (ค่าใหม่) แปลงเป็น pH ถ้ามี
+      // ถ้าไม่มี pHvolt ค่อยใช้ phFromStatus
       final phFromStatus = _asDouble(s['ph']);
       final pHvolt       = _asDouble(s['pHvolt']);
-      final phValue      = phFromStatus ?? pHvolt; // เอามาแสดงในหน้า Home เป็น _ph
+      final phValue      = pHvolt != null 
+          ? _convertPhVoltToPh(pHvolt)  // ใช้ pHvolt แปลงเป็น pH (ค่าใหม่)
+          : phFromStatus;  // ถ้าไม่มี pHvolt ค่อยใช้ phFromStatus
 
       return {
         'phase': (s['phase'] ?? 'idle').toString(),
