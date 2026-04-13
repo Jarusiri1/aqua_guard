@@ -3,6 +3,8 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart'; // debugPrint
 
+import '../models/tank.dart'; // <--- เติมบรรทัดนี้ครับ
+
 class TankService {
   static final _db = FirebaseFirestore.instance;
 
@@ -20,32 +22,20 @@ class TankService {
     return int.tryParse(x.toString());
   }
 
-  /// แปลงค่าโวลต์จาก pH sensor เป็นค่า pH
-  /// สูตร: pH = 7 - (voltage - 2.5) / 0.18
-  /// ที่ pH 7 (น้ำปกติ) จะได้ voltage = 2.5V
-  /// ถ้า voltage เพิ่มขึ้น pH จะลดลง (เป็นกรด)
-  /// ถ้า voltage ลดลง pH จะเพิ่มขึ้น (เป็นด่าง)
-  /// 
-  /// ตัวอย่าง:
-  /// - voltage = 2.5V → pH = 7.0 (น้ำปกติ)
-  /// - voltage = 3.5V → pH = 1.4 (กรดแรง)
-  /// - voltage = 1.5V → pH = 12.6 (ด่างแรง)
+
   static double? _convertPhVoltToPh(double? voltage) {
     if (voltage == null) return null;
-    // สูตรแปลงโวลต์เป็น pH: pH = 7 - (voltage - 2.5) / 0.18
-    // สำหรับ pH sensor ที่มี offset 2.5V ที่ pH 7
-    // สูตรนี้ใช้สำหรับ sensor ที่มี slope -0.18 V/pH unit
+    //สูตรแปลงโวลต์เป็น pH: pH = 7 - (voltage - 2.5) / 0.18
     final ph = 7.0 - (voltage - 2.5) / 0.18;
-    // จำกัดค่า pH ระหว่าง 0-14
+    //จำกัดค่า pHระหว่าง 0-14
     if (ph < 0) return 0.0;
     if (ph > 14) return 14.0;
     return ph;
   }
 
-  // ========= Bootstrapping =========
-  /// เรียกครั้งเดียว (หรือทุกครั้งที่เปิดหน้า) เพื่อให้มั่นใจว่ามี doc/โครงสร้างพื้นฐาน
+  //เรียก
   static Future<void> ensureDeviceInitialized(String tankId) async {
-    // ต้องมีผู้ใช้ก่อน (rules เช็ค owner)
+    // ต้องมีผู้ใช้ก่อนเช็คown
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) {
       await FirebaseAuth.instance.signInAnonymously();
@@ -106,7 +96,6 @@ devRef.collection('ctrl').doc('levels').set({
     ]);
   }
 
-  // ========= Read metrics (ปกติ) =========
   /// อ่านค่า metric ปัจจุบันจาก devices/{tankId}
   static Future<Map<String, dynamic>> fetchLatest(String tankId) async {
   final uid = FirebaseAuth.instance.currentUser?.uid;
@@ -162,8 +151,6 @@ devRef.collection('ctrl').doc('levels').set({
   }
 }
 
-
-  // ========= On-demand turbidity =========
   /// บั้มป์ nonce เพื่อสั่ง Pi ให้วัด turbidity 1 ครั้ง
   static Future<void> requestTurbidityOnce(String tankId) async {
     final ref = _db
@@ -195,8 +182,8 @@ static Future<void> requestLevelsOnce(String tankId) async {
 }
 
 
-  /// สั่งวัด แล้ว "รอจนได้ค่าใหม่" (updatedAt เปลี่ยน) ภายใน timeout
-  /// ใช้ในปุ่ม Refresh แทนการ delay ตายตัว จะเนียนและแม่นกว่า
+  /// สั่งวัดอจนได้ค่าใหม่"ฃ
+  /// ใช้ในปุ่ม Refres
   static Future<Map<String, dynamic>> bumpAndFetchLatest(
   String tankId, {
   Duration timeout = const Duration(seconds: 6),
@@ -214,13 +201,13 @@ static Future<void> requestLevelsOnce(String tankId) async {
     } catch (_) {}
   } catch (_) {}
 
-  // สั่งวัด: turbidity/tempC/pH + water levels
+  //turbidity/tempC/pH + water levels
   await Future.wait([
     requestTurbidityOnce(tankId),
     requestLevelsOnce(tankId),
   ]);
 
-  // เว้นระยะสั้น ๆ ให้ daemon ทำงาน (pH sensor อาจต้องใช้เวลาเสถียร)
+  //เว้นให้ทำงาน pHsensorองใช้เวลา
   await Future.delayed(minWait);
 
   try {
@@ -338,4 +325,152 @@ static Future<void> requestLevelsOnce(String tankId) async {
       'updatedAt': FieldValue.serverTimestamp(),
     }, SetOptions(merge: true));
   }
+
+  // -----------------------------------------------------------
+  // >>>> เริ่มวางโค้ดใหม่ตรงนี้ (ต่อจาก sendWaterCommand) <<<<
+  // -----------------------------------------------------------
+
+  /// 1. ฟังก์ชันเพิ่มตู้ (ผูก User กับ Serial Number)
+  static Future<void> linkTankToUser(String serialNumber, String customName) async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) throw Exception('กรุณาเข้าสู่ระบบก่อนเพิ่มตู้');
+
+    final db = FirebaseFirestore.instance;
+
+    // เช็คว่ามี Serial Number นี้จริงไหมใน collection 'devices'
+    final deviceDoc = await db.collection('devices').doc(serialNumber).get();
+    if (!deviceDoc.exists) {
+      throw Exception('ไม่พบรหัสตู้ $serialNumber ในระบบ');
+    }
+
+    // บันทึกลง user profile
+    await db.collection('users')
+        .doc(user.uid)
+        .collection('my_tanks')
+        .doc(serialNumber)
+        .set({
+          'id': serialNumber,
+
+          'sn': serialNumber,
+          'name': customName.isEmpty ? 'My Tank' : customName,
+          'addedAt': FieldValue.serverTimestamp(),
+        });
+  }
+
+  /// 2. ฟังก์ชันดึงรายชื่อตู้ของ User คนนั้นๆ
+  static Future<List<Tank>> getMyTanks() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return [];
+
+    final db = FirebaseFirestore.instance;
+    final snapshot = await db
+        .collection('users')
+        .doc(user.uid)
+        .collection('my_tanks')
+        .orderBy('addedAt', descending: true)
+        .get();
+
+    return snapshot.docs.map((doc) {
+      final data = doc.data();
+      // ใช้ doc.id (= serial number) เป็น tank ID เสมอ
+      // เพราะ field 'id' ใน document อาจว่างเปล่า
+      final tank = Tank.fromMap({...data, 'id': doc.id});
+      return tank;
+    }).toList();
+  }
+
+  /// 3. ฟังก์ชันลบตู้ (ยกเลิกการผูก User กับ Serial Number)
+  static Future<void> unlinkTankFromUser(String serialNumber) async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) throw Exception('กรุณาเข้าสู่ระบบก่อนดำเนินการ');
+
+    final db = FirebaseFirestore.instance;
+
+    try {
+      // ลบเอกสารตู้ออกจากคอลเลกชัน my_tanks ของผู้ใช้ปัจจุบัน
+      await db.collection('users')
+          .doc(user.uid)
+          .collection('my_tanks')
+          .doc(serialNumber)
+          .delete();
+          
+      debugPrint('Unlinked tank $serialNumber from user ${user.uid}');
+    } catch (e) {
+      debugPrint('Error unlinking tank: $e');
+      rethrow;
+    }
+  }
+
+  // ========= Sensor History (Dashboard) =========
+
+  /// บันทึกค่าเซนเซอร์ลง devices/{tankId}/logs
+  /// เรียกทุกครั้งที่ refresh สำเร็จ
+  static Future<void> logSensorReading(String tankId, {
+    double? ph,
+    double? tempC,
+    double? turbidity,
+    bool? levelLow,
+  }) async {
+    try {
+      await _db.collection('devices').doc(tankId).collection('logs').add({
+        'ph': ph,
+        'tempC': tempC,
+        'turbidity': turbidity,
+        'levelLow': levelLow,
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+    } catch (e) {
+      debugPrint('logSensorReading error: $e');
+    }
+  }
+
+  /// ดึงประวัติเซนเซอร์ย้อนหลัง
+  /// รองรับการจำกัดจำนวน (limit) เพื่อประหยัด Quota
+  /// return List<Map> เรียงตามเวลา (เก่า → ใหม่) สำหรับวาดกราฟ
+  static Future<List<Map<String, dynamic>>> fetchSensorHistory(
+    String tankId, {
+    int? days,
+    int? limit,
+  }) async {
+    // 💡 สังเกตว่าเราใช้ collection('logs') ดังนั้นใน Python ต้องบันทึกลง 'logs' ด้วยนะครับ
+    Query query = _db.collection('devices').doc(tankId).collection('logs');
+
+    if (limit != null) {
+      // ถ้าขอดูเป็นนาที (มี limit) ให้ดึงข้อมูลล่าสุดตามจำนวน limit
+      query = query.orderBy('createdAt', descending: true).limit(limit);
+    } else if (days != null) {
+      // ถ้าขอดูเป็นวัน (7 วัน)
+      final cutoff = DateTime.now().subtract(Duration(days: days));
+      query = query
+          .where('createdAt', isGreaterThanOrEqualTo: Timestamp.fromDate(cutoff))
+          .orderBy('createdAt', descending: true); // เรียงจากใหม่ไปเก่าก่อน
+    }
+
+    final snap = await query.get();
+
+    final docs = snap.docs.map((doc) {
+      final d = doc.data() as Map<String, dynamic>;
+      
+      // รองรับ timestamp ทั้ง 2 ชื่อ (createdAt ของ Dart, timestamp ของ Python)
+      final ts = d['createdAt'] ?? d['timestamp']; 
+      
+      // แปลงค่า pHvolt เป็น pH (ถ้ามีค่า pHvolt ส่งมาจาก Python)
+      final pHvolt = _asDouble(d['pHvolt']);
+      final phValue = pHvolt != null ? _convertPhVoltToPh(pHvolt) : _asDouble(d['ph']);
+
+      return {
+        'ph': phValue, 
+        'tempC': _asDouble(d['tempC']),
+        'turbidity': _asDouble(d['turbidity']),
+        'levelLow': d['levelLow'],
+        'createdAt': (ts as Timestamp?)?.toDate(),
+      };
+    }).toList();
+
+    // 💡 ต้อง .reversed เพื่อกลับให้ข้อมูลเรียงจาก "ซ้ายไปขวา (เก่ามาใหม่)" ให้ Chart.js วาดกราฟถูกต้อง
+    return docs.reversed.toList();
+  }
+
 }
+
+

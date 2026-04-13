@@ -57,6 +57,8 @@ class _LoginPageState extends State<LoginPage> {
     return Scaffold(
       appBar: AppBar(title: const Text('เข้าสู่ระบบ')),
       body: Center(
+
+        child: SingleChildScrollView(
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 520),
           child: Padding(
@@ -95,8 +97,10 @@ class _LoginPageState extends State<LoginPage> {
                   child: FilledButton(onPressed: _login, child: const Text('เข้าสู่ระบบ')),
                 ),
                 const SizedBox(height: 12),
+
                 Text(
                   _message,
+                  textAlign: TextAlign.center,
                   style: TextStyle(
                     color: _message.contains('สำเร็จ') ? Colors.green : Colors.red,
                     fontWeight: FontWeight.w600,
@@ -120,6 +124,7 @@ class _LoginPageState extends State<LoginPage> {
           ),
         ),
       ),
+    ),
     );
   }
 }
