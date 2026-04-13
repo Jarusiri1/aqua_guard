@@ -45,6 +45,11 @@ class _HomePageState extends State<HomePage> {
   bool _autoFilling = false;
   Timer? _autoFillTimer;
 
+  // Auto water-change: เปลี่ยนน้ำอัตโนมัติเมื่อน้ำขุ่น (drain → พัก → fill)
+  bool _isWaterChanging = false;
+  Timer? _waterChangeTimer;
+  DateTime? _lastWaterChangeTime; // cooldown 5 นาที กัน trigger ซ้ำ
+
   double? _ph, _tempC, _turbidity; // ค่าเซนเซอร์
   bool? _phSensorActive; // สถานะว่า pH sensor อ่านค่าได้ไม
   int? _moving, _noMoving;
@@ -77,6 +82,7 @@ class _HomePageState extends State<HomePage> {
   void dispose() {
     _timer?.cancel();
     _autoFillTimer?.cancel();
+    _waterChangeTimer?.cancel();
     _waterSub?.cancel();
     _video?.dispose();
     super.dispose();
@@ -233,7 +239,8 @@ class _HomePageState extends State<HomePage> {
         });
 
         // ถ้าเพิ่งเปลี่ยนจากปกติ → น้ำต่ำ ให้ auto-fill ทันที
-        if (!newLevelLow && oldLevelLow != false) {
+        // แต่ถ้ากำลังเปลี่ยนน้ำอยู่ (drain→fill) ให้ข้ามไป ไม่งั้นจะเติมซ้ำ
+        if (!newLevelLow && oldLevelLow != false && !_isWaterChanging) {
           _showTopBanner('⚠️ ระดับน้ำต่ำ', 'ตรวจพบน้ำระดับต่ำ กำลังเติมน้ำอัตโนมัติ...', isDanger: true);
           _triggerAutoFill();
         }
@@ -314,7 +321,7 @@ Future<void> _refreshAll() async {
       levelLow: _levelLow,
     );
 
-     // 🟢🟢 จุดที่เพิ่มเข้ามา: สั่งให้ Pop-up เด้งตรงนี้ 🟢🟢
+     // จุดที่เพิ่มเข้ามา: สั่งให้ Pop-up เด้งตรงนี้
     if (_phSensorActive == true && _ph != null) {
       if (_ph! < 6.5 || _ph! > 8.0) {
         _showTopBanner("⚠️ คุณภาพน้ำผิดปกติ", "ค่า pH อยู่ที่ ${_ph!.toStringAsFixed(1)} (ควรอยู่ระหว่าง 6.5-8.0)", isDanger: true);
@@ -323,11 +330,14 @@ Future<void> _refreshAll() async {
 
     if (_turbidity != null && _turbidity! > 100) {
       _showTopBanner("⚠️ ตรวจพบน้ำขุ่น", "ค่าความขุ่นสูงผิดปกติ: ${_turbidity!.toStringAsFixed(1)} NTU", isDanger: true);
+      // สั่งเปลี่ยนน้ำอัตโนมัติ (drain → พัก → fill)
+      _triggerAutoWaterChange();
     }
 
-    if (_levelLow == false) { 
+    // เติมน้ำอัตโนมัติเมื่อ float switch ตก
+    // แต่ถ้ากำลังเปลี่ยนน้ำอยู่ ให้ข้ามไป (ไม่งั้น fill จะซ้ำกับ drain)
+    if (_levelLow == false && !_isWaterChanging) { 
        _showTopBanner("⚠️ ระดับน้ำต่ำ", "กรุณาเติมน้ำเพื่อความปลอดภัยของปลา", isDanger: true);
-       // เติมน้ำอัตโนมัติ 5 วินาที เมื่อ float switch ตก
        _triggerAutoFill();
     }
     
@@ -342,8 +352,8 @@ Future<void> _refreshAll() async {
 
   /// เติมน้ำอัตโนมัติ 5 วินาที เมื่อ float switch ตรวจจับน้ำระดับต่ำ
   Future<void> _triggerAutoFill() async {
-    // กัน trigger ซ้ำ: ถ้ากำลังเติมอยู่แล้วจะไม่ทำซ้ำ
-    if (_autoFilling) return;
+    // กัน trigger ซ้ำ: ถ้ากำลังเติมอยู่แล้ว หรือกำลังเปลี่ยนน้ำอยู่ จะไม่ทำซ้ำ
+    if (_autoFilling || _isWaterChanging) return;
     final tank = _selectedTank;
     if (tank == null) return;
 
@@ -365,7 +375,7 @@ Future<void> _refreshAll() async {
       _autoFillTimer = Timer(const Duration(seconds: 5), () async {
         try {
           await TankService.sendWaterCommand(tank.id, 'stop');
-          debugPrint('🔵 Auto-fill stopped for ${tank.id}');
+          debugPrint('Auto-fill stopped for ${tank.id}');
           if (mounted) {
             _showTopBanner(
               'เติมน้ำเสร็จแล้ว',
@@ -382,6 +392,99 @@ Future<void> _refreshAll() async {
     } catch (e) {
       debugPrint('Auto-fill start error: $e');
       if (mounted) setState(() => _autoFilling = false);
+    }
+  }
+
+  /// เปลี่ยนน้ำอัตโนมัติเมื่อ turbidity สูง: drain 10 วิ → พัก 3 วิ → fill 10 วิ
+  Future<void> _triggerAutoWaterChange() async {
+    // กัน trigger ซ้ำ
+    if (_isWaterChanging || _autoFilling) return;
+    final tank = _selectedTank;
+    if (tank == null) return;
+
+    // Cooldown: ไม่เปลี่ยนน้ำซ้ำภายใน 5 นาที (นับจากรอบล่าสุดเสร็จ)
+    final now = DateTime.now();
+    if (_lastWaterChangeTime != null &&
+        now.difference(_lastWaterChangeTime!).inMinutes < 5) {
+      debugPrint('Water change skipped: cooldown active');
+      return;
+    }
+    // ไม่ตั้ง _lastWaterChangeTime ตรงนี้ → ย้ายไปตั้งตอนเสร็จสิ้น (Step 4)
+
+    setState(() => _isWaterChanging = true);
+
+    try {
+      // ===== Step 1: DRAIN 10 วินาที =====
+      await TankService.sendWaterCommand(tank.id, 'drain');
+      debugPrint('🔵 Water change: DRAIN started');
+      _showTopBanner(
+        'เปลี่ยนน้ำ: ระบายน้ำออก',
+        'ตรวจพบน้ำขุ่น — กำลังระบายน้ำออก (10 วิ)...',
+        isDanger: false,
+      );
+
+      _waterChangeTimer?.cancel();
+      _waterChangeTimer = Timer(const Duration(seconds: 10), () async {
+        if (!mounted) { _isWaterChanging = false; return; }
+        try {
+          // ===== Step 2: หยุด drain → พัก 3 วินาที =====
+          await TankService.sendWaterCommand(tank.id, 'stop');
+          debugPrint('Water change: DRAIN stopped, pausing 3s...');
+          if (mounted) {
+            _showTopBanner(
+              'เปลี่ยนน้ำ: ระบายเสร็จ',
+              'ระบายน้ำเสร็จ — รอ 3 วินาที...',
+              isDanger: false,
+            );
+          }
+
+          _waterChangeTimer = Timer(const Duration(seconds: 3), () async {
+            if (!mounted) { _isWaterChanging = false; return; }
+            try {
+              // ===== Step 3: FILL 10 วินาที =====
+              await TankService.sendWaterCommand(tank.id, 'fill');
+              debugPrint('🔵 Water change: FILL started');
+              if (mounted) {
+                _showTopBanner(
+                  'เปลี่ยนน้ำ: เติมน้ำใหม่',
+                  'กำลังเติมน้ำใหม่ (10 วิ)...',
+                  isDanger: false,
+                );
+              }
+
+              _waterChangeTimer = Timer(const Duration(seconds: 10), () async {
+                if (!mounted) { _isWaterChanging = false; return; }
+                try {
+                  // ===== Step 4: STOP → เสร็จสิ้น =====
+                  await TankService.sendWaterCommand(tank.id, 'stop');
+                  debugPrint('Water change: COMPLETE ');
+                  if (mounted) {
+                    _lastWaterChangeTime = DateTime.now(); // เริ่มนับ cooldown ตอนเสร็จ
+                    _showTopBanner(
+                      'เปลี่ยนน้ำ: เสร็จสิ้น',
+                      'ระบบเปลี่ยนน้ำอัตโนมัติเสร็จสิ้น (drain → fill)',
+                      isDanger: false,
+                    );
+                    setState(() => _isWaterChanging = false);
+                  }
+                } catch (e) {
+                  debugPrint('Water change fill-stop error: $e');
+                  if (mounted) setState(() => _isWaterChanging = false);
+                }
+              });
+            } catch (e) {
+              debugPrint('Water change fill-start error: $e');
+              if (mounted) setState(() => _isWaterChanging = false);
+            }
+          });
+        } catch (e) {
+          debugPrint('Water change drain-stop error: $e');
+          if (mounted) setState(() => _isWaterChanging = false);
+        }
+      });
+    } catch (e) {
+      debugPrint('Water change drain-start error: $e');
+      if (mounted) setState(() => _isWaterChanging = false);
     }
   }
 
