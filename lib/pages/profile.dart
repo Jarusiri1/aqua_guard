@@ -67,6 +67,17 @@ class _ProfilePageState extends State<ProfilePage> {
     return _phoneRegex.hasMatch(s) ? null : 'เบอร์โทรต้อง 10 หลักและขึ้นต้น 0';
   }
 
+  Stream<DocumentSnapshot<Map<String, dynamic>>>? _userStream;
+
+  @override
+  void initState() {
+    super.initState();
+    final user = FirebaseAuth.instance.currentUser;
+    if (user != null) {
+      _userStream = FirebaseFirestore.instance.collection('users').doc(user.uid).snapshots();
+    }
+  }
+
   @override
   void dispose() {
     _firstName.dispose();
@@ -108,6 +119,9 @@ class _ProfilePageState extends State<ProfilePage> {
     try {
       await FirebaseFirestore.instance.runTransaction((tx) async {
         final userRef = FirebaseFirestore.instance.collection('users').doc(uid);
+        
+        // ต้องอ่านข้อมูลก่อนเขียนเสมอใน Transaction
+        await tx.get(userRef);
 
         if (newUser != oldUser && newUser.isNotEmpty) {
           final newRef = FirebaseFirestore.instance.collection('usernames').doc(newUser);
@@ -115,7 +129,13 @@ class _ProfilePageState extends State<ProfilePage> {
               ? FirebaseFirestore.instance.collection('usernames').doc(oldUser)
               : null;
 
+          // อ่านข้อมูลทั้งหมดที่ต้องใช้ก่อน
           final newSnap = await tx.get(newRef);
+          DocumentSnapshot? oldSnap;
+          if (oldRef != null) {
+            oldSnap = await tx.get(oldRef);
+          }
+
           if (newSnap.exists) {
             throw FirebaseException(
               plugin: 'firestore',
@@ -124,13 +144,11 @@ class _ProfilePageState extends State<ProfilePage> {
             );
           }
 
+          // เริ่มทำการเขียน/ลบ/อัปเดต
           tx.set(newRef, {'uid': uid, 'createdAt': FieldValue.serverTimestamp()});
 
-          if (oldRef != null) {
-            final oldSnap = await tx.get(oldRef);
-            if (oldSnap.exists && (oldSnap.data() as Map?)?['uid'] == uid) {
-              tx.delete(oldRef);
-            }
+          if (oldSnap != null && oldSnap.exists && (oldSnap.data() as Map?)?['uid'] == uid) {
+            tx.delete(oldRef!);
           }
         }
 
@@ -150,6 +168,14 @@ class _ProfilePageState extends State<ProfilePage> {
         _editing = false;
         _msg = 'บันทึกข้อมูลเรียบร้อย';
         _msgIsError = false;
+      });
+
+      Future.delayed(const Duration(seconds: 5), () {
+        if (mounted && _msg == 'บันทึกข้อมูลเรียบร้อย') {
+          setState(() {
+            _msg = '';
+          });
+        }
       });
     } on FirebaseException catch (e) {
       setState(() {
@@ -176,7 +202,7 @@ class _ProfilePageState extends State<ProfilePage> {
   Widget build(BuildContext context) {
     final user = FirebaseAuth.instance.currentUser;
 
-    if (user == null) {
+    if (user == null || _userStream == null) {
       return Scaffold(
         appBar: AppBar(title: const Text('โปรไฟล์')),
         body: Padding(
@@ -206,7 +232,6 @@ class _ProfilePageState extends State<ProfilePage> {
 
     final uid = user.uid;
     final email = user.email ?? '-';
-    final userDoc = FirebaseFirestore.instance.collection('users').doc(uid);
 
     return Scaffold(
       appBar: AppBar(
@@ -230,7 +255,7 @@ class _ProfilePageState extends State<ProfilePage> {
         ],
       ),
       body: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-        stream: userDoc.snapshots(),
+        stream: _userStream,
         builder: (context, snap) {
           final cs = Theme.of(context).colorScheme;
           if (snap.connectionState == ConnectionState.waiting) {
@@ -407,17 +432,21 @@ class _ProfilePageState extends State<ProfilePage> {
                       Text('อีเมล: $email', style: _lineStyle),
                       const SizedBox(height: 6),
                       Text('เบอร์โทร: ${phone.isEmpty ? '-' : phone}', style: _lineStyle),
-                      const SizedBox(height: 16),
+                      const Spacer(),
                       if (_msg.isNotEmpty)
-                        Text(
-                          _msg,
-                          style: TextStyle(
-                            fontSize: 18,
-                            color: _msgIsError ? Colors.red : Colors.green,
-                            fontWeight: FontWeight.w700,
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 16.0),
+                          child: Center(
+                            child: Text(
+                              _msg,
+                              style: TextStyle(
+                                fontSize: 18,
+                                color: _msgIsError ? Colors.red : Colors.green,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
                           ),
                         ),
-                      const Spacer(),
                       SizedBox(
                         width: double.infinity,
                         child: FilledButton.icon(
